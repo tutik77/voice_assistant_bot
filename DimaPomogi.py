@@ -1,13 +1,13 @@
 import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
-from aiogram.types import ContentType
 from config import settings
 import openai
 import asyncio
 import os
 from openai import AsyncOpenAI
 from aiogram.types import FSInputFile
+import json
 
 logging.basicConfig(level=logging.INFO)
 
@@ -41,6 +41,9 @@ tools_list = [{
     }
 }]
 
+async def str_to_bool(value: str) -> bool:
+    return value.strip().lower() in ('true', '1', 'yes', 'y')
+
 async def convert_voice_to_text(local_path: str) -> str:
     with open(local_path, "rb") as audio_file:
         response = await client.audio.transcriptions.create(
@@ -50,7 +53,15 @@ async def convert_voice_to_text(local_path: str) -> str:
     return response.text
 
 async def save_value(value: str):
-    await print("В СЕЙВ ВАЛЮ ЗАХОДИТ")
+    response = await client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{'role':'user', 'content': f"Проверь, может ли {value} являться ценностью или целью человека. Ответь только 'true' или 'false'"}]
+    )
+    resultbool = await str_to_bool(str(response.choices[0].message.content))
+
+    
+    return value, resultbool
+
 
 @dp.message(CommandStart())
 async def whatsupp_bro(message: types.Message):
@@ -65,6 +76,8 @@ async def whatsupp_bro(message: types.Message):
     global thread
     thread = await client.beta.threads.create()
     await message.reply("Бот запущен")
+    global user_id
+    user_id = message.from_user.id
 
 @dp.message(F.voice)
 async def handle_voice_message(message: types.Message):
@@ -88,22 +101,54 @@ async def handle_voice_message(message: types.Message):
 
     print(run.status)
 
+    response = "бля чел у тебя не генерит ничего в случае требуются действия"
+
     if run.status == "completed":
         messages = await client.beta.threads.messages.list(thread_id=thread.id)
         async for messagee in messages:
             if messagee.content[0].type == "text":
                 response = messagee.content[0].text.value
                 break
+
     elif run.status == "requires_action":
-        print("Вошло в requires_action")
+        required_actions = run.required_action.submit_tool_outputs.model_dump()
+        tool_outputs = []
+
+        for action in required_actions["tool_calls"]:
+            func_name = action['function']['name']
+            arguments = json.loads(action['function']['arguments'])
+            
+            if func_name == "save_value":
+                a, b = await save_value(value=arguments['value'])
+                output = a
+                tool_outputs.append({
+                    "tool_call_id": action['id'],
+                    "output": output
+                })
+            else:
+                raise ValueError(f"Unknown function: {func_name}")
+            
+        run2 = await client.beta.threads.runs.submit_tool_outputs(
+            thread_id=thread.id,
+            run_id=run.id,
+            tool_outputs=tool_outputs
+        )
+
+        while run2.status != "completed":
+            await asyncio.sleep(1)
+            run2 = await client.beta.threads.runs.poll(
+                thread_id=thread.id,
+                run_id=run2.id
+            )
+
         messages = await client.beta.threads.messages.list(thread_id=thread.id)
         async for messagee in messages:
             if messagee.content[0].type == "text":
                 response = messagee.content[0].text.value
                 break
-        #ну и дальше типо извлечение ценности, проверка ее на адекватность
 
-        
+        await bot.send_message(message.chat.id, response)
+    
     speech_file_path = f"{DIRECTORY}/speech.mp3"
     with openai.audio.speech.with_streaming_response.create(
         model="tts-1",
